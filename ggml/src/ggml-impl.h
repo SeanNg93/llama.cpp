@@ -647,29 +647,26 @@ static inline bool ggml_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
     return ggml_can_fuse_ext(cgraph, idxs, ops, num_ops);
 }
 
-GGML_API bool ggml_can_fuse_subgraph_ext(
-        const struct ggml_cgraph * cgraph,
-        const int * node_idxs,
-        int count,
-        const enum ggml_op * ops,
-        const int * inputs,
-        int num_inputs,
-        const int * outputs,
-        int num_outputs);
+GGML_API bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+                                         const int *                node_idxs,
+                                         int                        count,
+                                         const enum ggml_op *       ops,
+                                         const int *                inputs,
+                                         int                        num_inputs,
+                                         const int *                outputs,
+                                         int                        num_outputs);
 
 // Returns true if the subgraph formed by {node_idxs} can be fused
 // checks whethers all nodes which are not part of inputs/outputs can be elided
 // by checking if their num_uses are confined to the subgraph
-static inline bool ggml_can_fuse_subgraph(
-        const struct ggml_cgraph * cgraph,
-        int node_idx,
-        int count,
-        const enum ggml_op * ops,
-        const int * inputs,
-        int num_inputs,
-        const int * outputs,
-        int num_outputs) {
-
+static inline bool ggml_can_fuse_subgraph(const struct ggml_cgraph * cgraph,
+                                          int                        node_idx,
+                                          int                        count,
+                                          const enum ggml_op *       ops,
+                                          const int *                inputs,
+                                          int                        num_inputs,
+                                          const int *                outputs,
+                                          int                        num_outputs) {
     if (node_idx + count > cgraph->n_nodes) {
         return false;
     }
@@ -696,21 +693,13 @@ inline bool ggml_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::
     return ggml_can_fuse(cgraph, node_idx, ops.begin(), (int)ops.size());
 }
 
-inline bool ggml_can_fuse_subgraph(
-        const struct ggml_cgraph * cgraph,
-        int start_idx,
-        std::initializer_list<enum ggml_op> ops,
-        std::initializer_list<int> inputs = {},
-        std::initializer_list<int> outputs = {}) {
-    return ggml_can_fuse_subgraph(
-        cgraph,
-        start_idx,
-        ops.size(),
-        ops.begin(),
-        inputs.begin(),
-        inputs.size(),
-        outputs.begin(),
-        outputs.size());
+inline bool ggml_can_fuse_subgraph(const struct ggml_cgraph *          cgraph,
+                                   int                                 start_idx,
+                                   std::initializer_list<enum ggml_op> ops,
+                                   std::initializer_list<int>          inputs  = {},
+                                   std::initializer_list<int>          outputs = {}) {
+    return ggml_can_fuse_subgraph(cgraph, start_idx, ops.size(), ops.begin(), inputs.begin(), inputs.size(),
+                                  outputs.begin(), outputs.size());
 }
 
 // expose GGUF internals for test code
