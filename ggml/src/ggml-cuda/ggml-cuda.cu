@@ -3860,6 +3860,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return;
     }
 
+#ifdef USE_CUDA_GRAPH
+    // Only optimize if CUDA graphs will actually be used
+    // Check the same conditions as graph_compute to avoid overhead when graphs are disabled
+    static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+
+    if (disable_cuda_graphs_due_to_env) {
+        return;
+    }
+
+    if (cuda_ctx->cuda_graph != nullptr &&
+        (cuda_ctx->cuda_graph->disable_due_to_gpu_arch ||
+         cuda_ctx->cuda_graph->disable_due_to_too_many_updates ||
+         cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture)) {
+        return;
+    }
+
+    // Check node compatibility - if CUDA graphs would be disabled, skip optimization
+    if (!check_node_graph_compatibility(cgraph, true)) {
+        return;
+    }
+#else
+    // CUDA graphs not compiled in, skip optimization
+    return;
+#endif
+
     GGML_ASSERT(ggml_backend_cuda_get_device_count() == 1 && "compute graph optimization is only supported on single GPU in the CUDA backend");
     GGML_LOG_DEBUG("Optimizing CUDA graph %p with %d nodes\n", cgraph->nodes, cgraph->n_nodes);
 
@@ -3924,6 +3949,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     for (const auto & [root_node, count] : fan_out) {
         if (count >= min_fan_out && count <= max_fan_out) {
+
             const int root_node_idx = node_indices[root_node];
 
             bool is_part_of_event = false;
