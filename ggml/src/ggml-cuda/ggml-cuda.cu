@@ -3096,10 +3096,6 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
 
-    // If in concurrent region, check all nodes belong to the same branch
-    if (!ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event)) {
-        return false;
-    }
 
     //TODO: remove special case once ggml_can_fuse can handle empty nodes
     std::initializer_list<enum ggml_op> topk_moe_ops =
@@ -3120,7 +3116,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         ggml_tensor * weights = cgraph->nodes[node_idx + 9];
 
         if (ggml_cuda_should_use_topk_moe(softmax, weights)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3128,7 +3124,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         ggml_tensor * softmax = cgraph->nodes[node_idx];
         ggml_tensor * weights = cgraph->nodes[node_idx + 4];
         if (ggml_cuda_should_use_topk_moe(softmax, weights)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3138,7 +3134,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         ggml_tensor * weights = cgraph->nodes[node_idx + 5];
 
         if (ggml_cuda_should_use_topk_moe(softmax, weights)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3157,7 +3153,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * glu           = cgraph->nodes[node_idx + 4];
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3168,7 +3164,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3180,7 +3176,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
 
         if (ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows)) {
-            return true;
+            return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
         }
     }
 
@@ -3227,7 +3223,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        return true;
+        return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
@@ -3248,7 +3244,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        return true;
+        return ggml_cuda_fusion_same_branch(cgraph, node_idx, ops.size(), concurrent_event);
     }
 
     return false;
@@ -3881,7 +3877,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return;
     }
 #else
-    // CUDA graphs not compiled in, skip optimization
     return;
 #endif
 
