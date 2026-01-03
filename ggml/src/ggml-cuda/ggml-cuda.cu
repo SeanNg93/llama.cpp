@@ -3610,6 +3610,62 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                         }
                     }
 
+                    // MMQ fusion: mul-mat + add (for general matrix sizes, not just vec)
+                    if (!fused_mul_mat_vec) {
+                        for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+                            const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+
+                            if (ggml_can_fuse(cgraph, i, { op, bias_op })){
+                                ggml_tensor * mm_node = cgraph->nodes[i];
+                                ggml_tensor * bias_node = cgraph->nodes[i + 1];
+
+                                const ggml_tensor * src0 = mm_node->src[0];
+                                const ggml_tensor * src1 = mm_node->src[1];
+                                const ggml_tensor * ids  = mm_node->src[2];
+
+                                auto get_bias_tensor = [](const ggml_tensor * bias_node, const ggml_tensor * mul_node, ggml_op op_bias) {
+                                    if (op_bias == GGML_OP_ADD) {
+                                        if (bias_node->src[0] == mul_node) {
+                                            return bias_node->src[1];
+                                        }
+                                        if (bias_node->src[1] == mul_node) {
+                                            return bias_node->src[0];
+                                        }
+                                        return (ggml_tensor *) nullptr;
+                                    }
+                                    GGML_ASSERT(op_bias == GGML_OP_ADD_ID);
+                                    GGML_ASSERT(bias_node->src[0] == mul_node);
+                                    return bias_node->src[1];
+                                };
+
+                                ggml_tensor * bias_tensor = get_bias_tensor(bias_node, mm_node, bias_op);
+
+                                if (!bias_tensor) {
+                                    continue;
+                                }
+
+                                // we don't support repeating adds
+                                if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+                                    continue;
+                                }
+
+                                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                                // For MUL_MAT_ID: ne12 = src1->ne[2], n_experts = src0->ne[2]
+                                // For MUL_MAT: ne11 = src1->ne[1], n_experts = 1
+                                const int64_t ne_batch = (op == GGML_OP_MUL_MAT_ID) ? src1->ne[2] : src1->ne[1];
+                                const int64_t n_experts = (op == GGML_OP_MUL_MAT_ID) ? src0->ne[2] : 1;
+                                bool use_mmq = ggml_cuda_should_use_mmq(src0->type, cc, ne_batch, n_experts);
+
+                                if (use_mmq) {
+                                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, bias_node, bias_tensor);
+                                    fused_mul_mat_vec = true;
+                                    fused_node_count = 2;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     if (fused_mul_mat_vec) {
                         i += fused_node_count - 1;
                         continue;

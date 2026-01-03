@@ -69,10 +69,12 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * bias) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!bias || bias->type == GGML_TYPE_F32); // Optional bias for fusion
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -82,6 +84,13 @@ void ggml_cuda_mul_mat_q(
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
     const size_t ts_dst  = ggml_type_size(dst->type);
+
+    // Bias fusion parameters
+    // For ID case: bias is 2D [n, n_experts], stride to next expert is nb[1]
+    // For non-ID case: bias is 4D [n, 1, channels, samples], stride to next channel is nb[2]
+    const float * bias_d = bias ? (const float *) bias->data : nullptr;
+    const int64_t stride_channel_bias = bias ? (ids ? bias->nb[1] : bias->nb[2]) / ggml_type_size(bias->type) : 0;
+    const int64_t stride_sample_bias = bias ? bias->nb[3] / ggml_type_size(bias->type) : 0;
 
     GGML_ASSERT(        nb00       == ts_src0);
     GGML_ASSERT(        nb10       == ts_src1);
@@ -152,7 +161,8 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1};
+            use_stream_k, ne1,
+            bias_d, stride_channel_bias, stride_sample_bias};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -212,7 +222,8 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ne12,
+        bias_d, stride_channel_bias, stride_sample_bias};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -252,7 +263,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        use_stream_k, src1_ncols, nullptr, 0, 0};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

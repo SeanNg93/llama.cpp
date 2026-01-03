@@ -3121,10 +3121,11 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-template<int mmq_x, int mmq_y, bool need_check>
+template<int mmq_x, int mmq_y, bool need_check, bool has_bias = false>
 static __device__ __forceinline__ void mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
-        const int stride, const int i_max, const int j_max) {
+        const int stride, const int i_max, const int j_max,
+        const float * __restrict__ bias = nullptr) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -3144,15 +3145,20 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
                 continue;
             }
 
-            dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            float result = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            if constexpr (has_bias) {
+                result += bias[i];
+            }
+            dst[ids_dst[j]*stride + i] = result;
         }
     }
 }
 
-template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
+template<ggml_type type, int mmq_x, int mmq_y, bool need_check, bool has_bias = false>
 static __device__ __forceinline__ void mmq_write_back_mma(
         const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
-        const int stride, const int i_max, const int j_max) {
+        const int stride, const int i_max, const int j_max,
+        const float * __restrict__ bias = nullptr) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -3192,7 +3198,11 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                float result = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                if constexpr (has_bias) {
+                    result += bias[i];
+                }
+                dst[ids_dst[j]*stride + i] = result;
             }
         }
     }
@@ -3360,12 +3370,13 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool has_bias = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const float * __restrict__ bias = nullptr) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3378,11 +3389,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
-    constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check>;
+    constexpr vec_dot_mmq_t    vec_dot          = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+    constexpr auto             write_back       = mmq_write_back_mma<type, mmq_x, mmq_y, need_check, has_bias>;
+    constexpr auto             write_back_fixup = mmq_write_back_mma<type, mmq_x, mmq_y, need_check, false>;
 #else
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
-    constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, need_check>;
+    constexpr vec_dot_mmq_t    vec_dot          = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
+    constexpr auto             write_back       = mmq_write_back_dp4a<mmq_x, mmq_y, need_check, has_bias>;
+    constexpr auto             write_back_fixup = mmq_write_back_dp4a<mmq_x, mmq_y, need_check, false>;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -3434,17 +3447,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
     }
 
+    // For fixup, we don't apply bias (will be applied in fixup kernel)
+    // For non-fixup path, apply bias if has_bias is true
     if (fixup) {
-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
+        write_back_fixup(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x, nullptr);
     } else {
-        write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+        write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j, bias);
     }
 }
 
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool has_bias = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3462,7 +3477,8 @@ static __global__ void mul_mat_q(
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int channel_ratio, const int nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ncols_max) {
+        const int ncols_max,
+        const float * __restrict__ bias = nullptr, const int stride_channel_bias = 0, const int stride_sample_bias = 0) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3544,10 +3560,15 @@ static __global__ void mul_mat_q(
 
         const int offset_x = (wt/sample_ratio)*stride_sample_x + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
+        const float * bias_ptr = nullptr;
+        if constexpr (has_bias) {
+            bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+        }
+
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, has_bias>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk);
+             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk, bias_ptr);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3624,10 +3645,15 @@ static __global__ void mul_mat_q(
 
         const int offset_x = (wt/sample_ratio)*stride_sample_x + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
+        const float * bias_ptr = nullptr;
+        if constexpr (has_bias) {
+            bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+        }
+
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, has_bias>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, bias_ptr);
 
         kbc += blocks_per_ne00;
         kbc -= kbc % blocks_per_ne00;
@@ -3691,19 +3717,25 @@ static __global__ void mul_mat_q(
 
     const int offset_x = (wt/sample_ratio)*stride_sample_x + (zt/channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
+    const float * bias_ptr = nullptr;
+    if constexpr (has_bias) {
+        bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+    }
+
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, has_bias>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, bias_ptr);
 }
 
 
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool has_bias = false>
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * __restrict__ dst, const float * __restrict__ tmp_last_tile,
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_dst,
         const int nchannels_y, const int stride_channel_dst, const int nsamples_y, const int stride_sample_dst,
-        const int ncols_max) {
+        const int ncols_max,
+        const float * __restrict__ bias = nullptr, const int stride_channel_bias = 0, const int stride_sample_bias = 0) {
     constexpr int     mmq_y           = get_mmq_y_device();
     constexpr int     qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int     ITER_K          = get_iter_k(type);
@@ -3790,6 +3822,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst + it*mmq_y;
         dst += offset_dst;
 
+        const float * bias_ptr = nullptr;
+        if constexpr (has_bias) {
+            bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+        }
+
         const int i_max = nrows_x   - it*mmq_y - 1;
         const int j_max = ncols_dst - jt*mmq_x - 1;
 
@@ -3809,7 +3846,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
                     continue;
                 }
 
-                dst[j*stride_col_dst + i] += sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+                float result = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+                if constexpr (has_bias) {
+                    result += bias_ptr[i];
+                }
+                dst[j*stride_col_dst + i] += result;
             }
         }
         return;
@@ -3827,6 +3868,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
     const int offset_dst = it*mmq_y;
     dst += offset_dst;
+
+    const float * bias_ptr = nullptr;
+    if constexpr (has_bias) {
+        bias_ptr = bias + wt*stride_sample_bias + zt*stride_channel_bias;
+    }
 
     const int i_max = nrows_x  - it*mmq_y - 1;
     const int j_max = col_diff - jt*mmq_x - 1;
@@ -3847,7 +3893,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
                 continue;
             }
 
-            dst[ids_dst_shared[j]*stride_col_dst + i] += sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            float result = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            if constexpr (has_bias) {
+                result += bias_ptr[i];
+            }
+            dst[ids_dst_shared[j]*stride_col_dst + i] += result;
         }
     }
 }
@@ -3858,6 +3908,8 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // Bias fusion parameters
+    const float * bias; int64_t stride_channel_bias; int64_t stride_sample_bias;
 };
 
 template<ggml_type type>
@@ -3883,8 +3935,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
+    const bool has_bias = args.bias != nullptr;
+
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true,  true>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
     const int ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
@@ -3897,22 +3953,42 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
     if (!args.use_stream_k) {
-        if (args.nrows_x % mmq_y == 0) {
-            constexpr bool need_check = false;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+        if (has_bias) {
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q<type, mmq_x, need_check, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q<type, mmq_x, need_check, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
+            }
         } else {
-            constexpr bool need_check = true;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q<type, mmq_x, need_check, false><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     args.ncols_max);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q<type, mmq_x, need_check, false><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                    (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                     args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                     channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                     sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                     args.ncols_max);
+            }
         }
         return;
     }
@@ -3926,40 +4002,78 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         tmp_fixup.alloc(block_nums_stream_k.x * mmq_x*mmq_y);
     }
 
-    if (args.nrows_x % mmq_y == 0) {
-        constexpr bool need_check = false;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
-             args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-             sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+    if (has_bias) {
+        if (args.nrows_x % mmq_y == 0) {
+            constexpr bool need_check = false;
+            mul_mat_q<type, mmq_x, need_check, true><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
 
-        if (!fixup_needed) {
-            return;
+            if (!fixup_needed) {
+                return;
+            }
+
+            mul_mat_q_stream_k_fixup<type, mmq_x, need_check, true><<<block_nums_stream_k, block_dims, 0, stream>>>
+                (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
+                 args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
+                 args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
+        } else {
+            constexpr bool need_check = true;
+            mul_mat_q<type, mmq_x, need_check, true><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
+
+            if (!fixup_needed) {
+                return;
+            }
+
+            mul_mat_q_stream_k_fixup<type, mmq_x, need_check, true><<<block_nums_stream_k, block_dims, 0, stream>>>
+                (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
+                 args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
+                 args.ncols_max, args.bias, args.stride_channel_bias, args.stride_sample_bias);
         }
-
-        mul_mat_q_stream_k_fixup<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
-             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-             args.ncols_max);
     } else {
-        constexpr bool need_check = true;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
-             args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-             sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+        if (args.nrows_x % mmq_y == 0) {
+            constexpr bool need_check = false;
+            mul_mat_q<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 args.ncols_max);
 
-        if (!fixup_needed) {
-            return;
+            if (!fixup_needed) {
+                return;
+            }
+
+            mul_mat_q_stream_k_fixup<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, 0, stream>>>
+                (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
+                 args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
+                 args.ncols_max);
+        } else {
+            constexpr bool need_check = true;
+            mul_mat_q<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+                 args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 args.ncols_max);
+
+            if (!fixup_needed) {
+                return;
+            }
+
+            mul_mat_q_stream_k_fixup<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, 0, stream>>>
+                (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
+                 args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
+                 args.ncols_max);
         }
-
-        mul_mat_q_stream_k_fixup<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
-             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-             args.ncols_max);
     }
 }
 
@@ -4074,7 +4188,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * bias = nullptr);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
