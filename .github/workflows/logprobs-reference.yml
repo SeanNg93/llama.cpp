@@ -1,0 +1,285 @@
+name: Logprobs Reference Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - runson-check-action
+    paths:
+      # Core llama source that affects logprobs computation
+      - 'src/**'
+      # CUDA backend
+      - 'ggml/src/ggml-cuda/**'
+      # Server implementation (logprobs endpoint)
+      - 'tools/server/**'
+      # GGML core (affects all computations)
+      - 'ggml/src/*.c'
+      - 'ggml/src/*.cpp'
+      - 'ggml/src/*.h'
+      # Logprobs reference files and scripts
+      - 'scripts/logprobs-reference/**'
+      - 'scripts/compare-logprobs.py'
+      # This workflow
+      - '.github/workflows/logprobs-reference.yml'
+
+env:
+  MODEL_REPO: "ggml-org/gpt-oss-20b-GGUF"
+  MODEL_FILE: "gpt-oss-20b-mxfp4.gguf"
+  REFERENCE_FILE: "scripts/logprobs-reference/gpt-oss-20b-mxfp4.logprobs.txt"
+
+jobs:
+  logprobs-test:
+    runs-on: "runs-on=${{ github.run_id }}/family=g4dn.12xlarge/image=ubuntu22-gpu-x64/"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Display GPU info
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libcurl4-openssl-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests huggingface_hub
+
+      - name: Build llama-server with CUDA
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DLLAMA_CURL=ON
+          cmake --build build --target llama-server -j $(nproc)
+
+      - name: Download model
+        run: |
+          python -c "
+          from huggingface_hub import hf_hub_download
+          hf_hub_download(
+              repo_id='${{ env.MODEL_REPO }}',
+              filename='${{ env.MODEL_FILE }}',
+              local_dir='./models'
+          )
+          "
+
+      # Test 1: Default configuration (all GPUs)
+      - name: "Test 1: Default - Start server"
+        run: |
+          echo "=== Test 1: Default configuration ==="
+          ./build/bin/llama-server \
+            --model ./models/${{ env.MODEL_FILE }} \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --n-gpu-layers 99 \
+            --ctx-size 8192 \
+            --temp 0.0 \
+            &
+          echo $! > server.pid
+
+          echo "Waiting for server to start..."
+          for i in {1..60}; do
+            if curl -s http://127.0.0.1:8080/health | grep -q "ok"; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 5
+          done
+
+      - name: "Test 1: Default - Dump and compare logprobs"
+        run: |
+          python scripts/compare-logprobs.py dump \
+            logprobs_test1_default.txt \
+            http://127.0.0.1:8080/v1/completions
+
+          python scripts/compare-logprobs.py compare \
+            ${{ env.REFERENCE_FILE }} \
+            logprobs_test1_default.txt \
+            comparison_test1_default.md
+
+          echo "=== Test 1: Default - Comparison Report ==="
+          cat comparison_test1_default.md
+
+      - name: "Test 1: Default - Stop server"
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+          sleep 2
+
+      # Test 2: n-cpu-moe
+      - name: "Test 2: n-cpu-moe - Start server"
+        run: |
+          echo "=== Test 2: n-cpu-moe 1 ==="
+          ./build/bin/llama-server \
+            --model ./models/${{ env.MODEL_FILE }} \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --n-gpu-layers 99 \
+            --n-cpu-moe 1 \
+            --ctx-size 8192 \
+            --temp 0.0 \
+            &
+          echo $! > server.pid
+
+          echo "Waiting for server to start..."
+          for i in {1..60}; do
+            if curl -s http://127.0.0.1:8080/health | grep -q "ok"; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 5
+          done
+
+      - name: "Test 2: n-cpu-moe - Dump and compare logprobs"
+        run: |
+          python scripts/compare-logprobs.py dump \
+            logprobs_test2_ncpumoe.txt \
+            http://127.0.0.1:8080/v1/completions
+
+          python scripts/compare-logprobs.py compare \
+            ${{ env.REFERENCE_FILE }} \
+            logprobs_test2_ncpumoe.txt \
+            comparison_test2_ncpumoe.md
+
+          echo "=== Test 2: n-cpu-moe - Comparison Report ==="
+          cat comparison_test2_ncpumoe.md
+
+      - name: "Test 2: n-cpu-moe - Stop server"
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+          sleep 2
+
+      # Test 3: Split-mode row (multi-GPU)
+      - name: "Test 3: split-mode row - Start server"
+        run: |
+          echo "=== Test 3: split-mode row (multi-GPU) ==="
+          ./build/bin/llama-server \
+            --model ./models/${{ env.MODEL_FILE }} \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --n-gpu-layers 99 \
+            --split-mode row \
+            --ctx-size 8192 \
+            --temp 0.0 \
+            &
+          echo $! > server.pid
+
+          echo "Waiting for server to start..."
+          for i in {1..60}; do
+            if curl -s http://127.0.0.1:8080/health | grep -q "ok"; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 5
+          done
+
+      - name: "Test 3: split-mode row - Dump and compare logprobs"
+        run: |
+          python scripts/compare-logprobs.py dump \
+            logprobs_test3_smrow.txt \
+            http://127.0.0.1:8080/v1/completions
+
+          python scripts/compare-logprobs.py compare \
+            ${{ env.REFERENCE_FILE }} \
+            logprobs_test3_smrow.txt \
+            comparison_test3_smrow.md
+
+          echo "=== Test 3: split-mode row - Comparison Report ==="
+          cat comparison_test3_smrow.md
+
+      - name: "Test 3: split-mode row - Stop server"
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+          sleep 2
+
+      # Test 4: Single GPU (CUDA_VISIBLE_DEVICES=1)
+      - name: "Test 4: Single GPU - Start server"
+        run: |
+          echo "=== Test 4: Single GPU (CUDA_VISIBLE_DEVICES=1) ==="
+          CUDA_VISIBLE_DEVICES=1 ./build/bin/llama-server \
+            --model ./models/${{ env.MODEL_FILE }} \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --n-gpu-layers 99 \
+            --ctx-size 8192 \
+            --temp 0.0 \
+            &
+          echo $! > server.pid
+
+          echo "Waiting for server to start..."
+          for i in {1..60}; do
+            if curl -s http://127.0.0.1:8080/health | grep -q "ok"; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 5
+          done
+
+      - name: "Test 4: Single GPU - Dump and compare logprobs"
+        run: |
+          python scripts/compare-logprobs.py dump \
+            logprobs_test4_singlegpu.txt \
+            http://127.0.0.1:8080/v1/completions
+
+          python scripts/compare-logprobs.py compare \
+            ${{ env.REFERENCE_FILE }} \
+            logprobs_test4_singlegpu.txt \
+            comparison_test4_singlegpu.md
+
+          echo "=== Test 4: Single GPU - Comparison Report ==="
+          cat comparison_test4_singlegpu.md
+
+      - name: "Test 4: Single GPU - Stop server"
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) 2>/dev/null || true
+            rm server.pid
+          fi
+
+      # Summary
+      - name: "Summary of all tests"
+        run: |
+          echo "========================================"
+          echo "       LOGPROBS TEST SUMMARY"
+          echo "========================================"
+          echo ""
+          echo "Test 1: Default"
+          cat comparison_test1_default.md
+          echo ""
+          echo "----------------------------------------"
+          echo "Test 2: n-cpu-moe"
+          cat comparison_test2_ncpumoe.md
+          echo ""
+          echo "----------------------------------------"
+          echo "Test 3: split-mode row"
+          cat comparison_test3_smrow.md
+          echo ""
+          echo "----------------------------------------"
+          echo "Test 4: Single GPU"
+          cat comparison_test4_singlegpu.md
+          echo ""
+          echo "========================================"

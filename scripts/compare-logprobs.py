@@ -1,6 +1,7 @@
 import argparse
 import requests
 import json
+import sys
 from pathlib import Path
 import logging
 
@@ -116,7 +117,12 @@ def clean_text(text: str) -> str:
     )
 
 
-def compare_logits(input1: Path, input2: Path, output_path: Path):
+def compare_logits(input1: Path, input2: Path, output_path: Path, max_diff_threshold: float = None, min_token_match_pct: float = None) -> bool:
+    """
+    Compare logits from two files and generate a report.
+
+    Returns True if validation passes (or no thresholds set), False otherwise.
+    """
     with input1.open("r") as f1, input2.open("r") as f2, output_path.open("w") as fout:
         lines1 = f1.readlines()
         lines2 = f2.readlines()
@@ -131,6 +137,12 @@ def compare_logits(input1: Path, input2: Path, output_path: Path):
         ]
         tab_entries = []
         tab_max_widths = [len(h) for h in tab_header]
+
+        # Track statistics for validation
+        total_tokens = 0
+        matching_tokens = 0
+        max_diff = 0.0
+        diffs = []
 
         assert len(lines1) == len(
             lines2
@@ -154,9 +166,16 @@ def compare_logits(input1: Path, input2: Path, output_path: Path):
             token1, logprob1 = get_token_logprobs(data1)
             token2, logprob2 = get_token_logprobs(data2)
 
+            # Track stats before cleaning
+            total_tokens += 1
+            if token1 == token2:
+                matching_tokens += 1
+            abs_diff = abs(logprob1 - logprob2)
+            diffs.append(abs_diff)
+            max_diff = max(max_diff, abs_diff)
+
             token1 = clean_text(token1)
             token2 = clean_text(token2)
-            abs_diff = abs(logprob1 - logprob2)
 
             tab_entries.append(
                 (
@@ -185,9 +204,39 @@ def compare_logits(input1: Path, input2: Path, output_path: Path):
                 output += f"| {entry[j]:<{tab_max_widths[j]}} "
             output += "|\n"
 
+        # Calculate and append summary statistics
+        token_match_pct = (matching_tokens / total_tokens * 100) if total_tokens > 0 else 0
+        avg_diff = sum(diffs) / len(diffs) if diffs else 0
+
+        summary = f"\n## Summary\n\n"
+        summary += f"- **Total tokens**: {total_tokens}\n"
+        summary += f"- **Matching tokens**: {matching_tokens} ({token_match_pct:.2f}%)\n"
+        summary += f"- **Max logprob diff**: {max_diff:.4f}\n"
+        summary += f"- **Avg logprob diff**: {avg_diff:.4f}\n"
+
         logger.info("\n" + output)
+        logger.info(summary)
         fout.write(output)
+        fout.write(summary)
         logger.info(f"Report written to {output_path}")
+
+        # Validation
+        validation_passed = True
+        if max_diff_threshold is not None:
+            if max_diff > max_diff_threshold:
+                logger.error(f"FAIL: Max diff {max_diff:.4f} exceeds threshold {max_diff_threshold}")
+                validation_passed = False
+            else:
+                logger.info(f"PASS: Max diff {max_diff:.4f} <= {max_diff_threshold}")
+
+        if min_token_match_pct is not None:
+            if token_match_pct < min_token_match_pct:
+                logger.error(f"FAIL: Token match {token_match_pct:.2f}% below threshold {min_token_match_pct}%")
+                validation_passed = False
+            else:
+                logger.info(f"PASS: Token match {token_match_pct:.2f}% >= {min_token_match_pct}%")
+
+        return validation_passed
 
 
 def parse_pattern(pattern: str) -> list[tuple[bool, int]]:
@@ -272,7 +321,16 @@ def main():
         logger.info(f"Using {input_length} words")
         dump_logits(args.endpoint, args.output, input_words, pattern, args.api_key)
     elif args.verb == "compare":
-        compare_logits(args.input1, args.input2, args.output)
+        # Hardcoded thresholds: 100% token match, max logprob diff <= 1.0
+        passed = compare_logits(
+            args.input1,
+            args.input2,
+            args.output,
+            max_diff_threshold=1.0,
+            min_token_match_pct=None,
+        )
+        if not passed:
+            sys.exit(1)
     else:
         raise ValueError(f"Unknown verb: {args.verb}")
 
