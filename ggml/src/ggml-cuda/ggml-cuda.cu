@@ -27,6 +27,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/moe-sort.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2287,7 +2288,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (false && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2312,23 +2313,46 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
-    std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
-
-    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
-
-    std::vector<int32_t> tokens_per_expert(ne02);
+    ggml_cuda_pool_alloc<int32_t> ids_to_sorted_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_from_sorted_dev(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> tokens_per_expert_dev(ctx.pool(), ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
+
+#ifdef GGML_CUDA_USE_CUB
+    // GPU-based sorting using CUB radix sort
+    moe_sort_cuda(
+        ctx.pool(),
+        (const int32_t *)ids->data,
+        ids->nb[0],
+        ids->nb[1],
+        ids_to_sorted_dev.ptr,
+        ids_from_sorted_dev.ptr,
+        tokens_per_expert_dev.ptr,
+        ne12,
+        n_expert_used,
+        ne11,
+        ne02,
+        stream);
+
+    // Copy only the small tokens_per_expert array to host (single sync)
+    std::vector<int32_t> tokens_per_expert(ne02);
+    CUDA_CHECK(cudaMemcpyAsync(tokens_per_expert.data(), tokens_per_expert_dev.ptr, ne02*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+#else
+    // Fallback: CPU-based sorting (original implementation)
+    std::vector<int32_t> ids_to_sorted_host;
+    ids_to_sorted_host.reserve(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> tokens_per_expert(ne02);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
@@ -2343,13 +2367,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_to_sorted_dev.ptr, ids_to_sorted_host.data(), ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_from_sorted_dev.ptr, ids_from_sorted_host.data(), ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+#endif
 
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_to_sorted_dev.ptr;
+    const int32_t * ids_from_sorted = ids_from_sorted_dev.ptr;
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
