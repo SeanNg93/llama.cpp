@@ -1586,6 +1586,41 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    // fast path for single-token decode (n_tokens == 1)
+    // skips row mapping setup and atomic work-stealing overhead,
+    // reduces to n_ids simple mat-vec products
+    if (ids->ne[1] == 1) {
+        ggml_barrier(params->threadpool);
+
+        ggml_vec_dot_t const vec_dot = type_traits_cpu[type].vec_dot;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        const int64_t ir0_start = (ith * ne01) / nth;
+        const int64_t ir0_end   = ((ith + 1) * ne01) / nth;
+
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + id * ids->nb[0]);
+
+            const char * src0_cur = (const char *) src0->data + expert_id * nb02;
+
+            const char * src1_col;
+            if (src1->type != vec_dot_type) {
+                src1_col = (const char *) params->wdata + id * row_size;
+            } else if (src1_cont) {
+                src1_col = (const char *) src1->data + id * row_size;
+            } else {
+                src1_col = (const char *) src1->data + id * nb11;
+            }
+
+            float * dst_col = (float *) ((char *) dst->data + id * nb1);
+
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                vec_dot(ne00, &dst_col[ir0], 0, src0_cur + ir0 * nb01, 0, src1_col, 0, 1);
+            }
+        }
+        return;
+    }
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
