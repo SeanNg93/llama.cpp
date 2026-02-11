@@ -151,7 +151,7 @@ llama_context::llama_context(
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = false; // TODO: implement
+    cparams.fused_gdn_ch = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -492,6 +492,42 @@ void llama_context::sched_reserve() {
         if (gdn_device_mismatch) {
             cparams.fused_gdn_ar = false;
             LLAMA_LOG_WARN("%s: fused Gated Delta Net not supported, set to disabled\n", __func__);
+        }
+    }
+
+    if (cparams.fused_gdn_ch) {
+        const uint32_t n_tokens_ch = 16 * n_seqs;
+        auto * gf = graph_reserve(n_tokens_ch, n_seqs, n_tokens_ch, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for fused Gated Delta Net (chunked) check");
+        }
+
+        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FGDNCH) + 1;
+        bool gdn_device_mismatch = false;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * n = ggml_graph_node(gf, i);
+            if (n->op != GGML_OP_GATED_DELTA_NET) {
+                continue;
+            }
+            ggml_backend_dev_t device_gdn = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+
+            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDNCH "-", prefix_len) == 0);
+            const int il = std::stoi(n->name + prefix_len);
+            ggml_backend_dev_t device_kv = model.dev_layer(il);
+            if (device_gdn != device_kv) {
+                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net (chunked) tensor "
+                        "is assigned to device %s (usually due to missing support)\n",
+                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
+                gdn_device_mismatch = true;
+                break;
+            }
+        }
+
+        if (gdn_device_mismatch) {
+            cparams.fused_gdn_ch = false;
+            LLAMA_LOG_WARN("%s: fused Gated Delta Net (chunked) not supported, set to disabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: fused Gated Delta Net (chunked) enabled\n", __func__);
         }
     }
 
