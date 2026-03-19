@@ -3555,6 +3555,53 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_SOFTPLUS + GGML_OP_MUL (fused operation)
+// Models the pattern: softplus(alpha + ssm_dt) * ssm_a
+// where alpha is 3D and ssm_dt/ssm_a are 1D (broadcast)
+struct test_softplus_fused : public test_case {
+    const ggml_type type;
+    const int64_t ne0;
+    const int64_t ne1;
+    const int64_t ne2;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FUSED_SOFTPLUS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne0, ne1, ne2);
+    }
+
+    test_softplus_fused(ggml_type type = GGML_TYPE_F32,
+            int64_t ne0 = 16, int64_t ne1 = 32, int64_t ne2 = 2)
+        : type(type), ne0(ne0), ne1(ne1), ne2(ne2) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha  = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+        ggml_set_name(alpha, "alpha");
+
+        ggml_tensor * ssm_dt = ggml_new_tensor_1d(ctx, type, ne0);
+        ggml_set_name(ssm_dt, "ssm_dt");
+
+        ggml_tensor * ssm_a  = ggml_new_tensor_1d(ctx, type, ne0);
+        ggml_set_name(ssm_a, "ssm_a");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, ssm_dt)), ssm_a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -5.0f, 5.0f);
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -7919,6 +7966,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+
+    // fused ADD + SOFTPLUS + MUL (broadcast 1D inputs)
+    test_cases.emplace_back(new test_softplus_fused(GGML_TYPE_F32, 16, 32, 2));
+    test_cases.emplace_back(new test_softplus_fused(GGML_TYPE_F32, 64,  1, 1));
+    test_cases.emplace_back(new test_softplus_fused(GGML_TYPE_F32, 24, 13, 3));
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {

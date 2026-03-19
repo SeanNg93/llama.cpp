@@ -50,6 +50,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
+#include "ggml-cuda/fused-softplus.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
@@ -3440,6 +3441,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS) {
+        const ggml_tensor * add     = cgraph->nodes[node_idx];
+        const ggml_tensor * softplus = cgraph->nodes[node_idx+1];
+        const ggml_tensor * mul     = cgraph->nodes[node_idx+2];
+
+        if (ggml_get_unary_op(softplus) != GGML_UNARY_OP_SOFTPLUS) {
+            return false;
+        }
+
+        if (add->type != GGML_TYPE_F32 || add->type != softplus->type || softplus->type != mul->type) {
+            return false;
+        }
+
+        const ggml_tensor * ssm_a = (mul->src[0] == softplus) ? mul->src[1] : mul->src[0];
+
+        if (ssm_a->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_1(add->src[0]) || !ggml_is_contiguous_1(add->src[1]) || !ggml_is_contiguous_1(ssm_a)) {
+            return false;
+        }
+
+        if (add->src[0]->ne[0] != mul->ne[0] || add->src[1]->ne[0] != mul->ne[0] || ssm_a->ne[0] != mul->ne[0]) {
+            return false;
+        }
+
+        return true;
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
@@ -4004,6 +4036,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
                         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+                        ggml_tensor * add_node = cgraph->nodes[i];
+                        ggml_tensor * mul_node = cgraph->nodes[i+2];
+
+                        ggml_cuda_op_fused_softplus(*cuda_ctx, mul_node, add_node->src[0], add_node->src[1]);
+                        i += 2;
                         continue;
                     }
 
