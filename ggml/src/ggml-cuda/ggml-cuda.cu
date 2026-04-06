@@ -3056,10 +3056,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // and store properties to allow this comparison for the next token
 
     // Mark all nodes so we can identify non-node sources in O(1)
-    // Use a bit outside the public ggml_tensor_flag enum
-    const int32_t flag_seen = (1 << 31);
-    static_assert(!(flag_seen & ((GGML_TENSOR_FLAG_COMPUTE << 1) - 1)),
-        "flag_seen collides with public ggml_tensor_flag bits");
+    //
+    const int32_t flag_seen = GGML_TENSOR_FLAG_UNUSED;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         cgraph->nodes[i]->flags |= flag_seen;
