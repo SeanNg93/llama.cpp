@@ -672,6 +672,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_mtp_logits  = nullptr; // Qwen3.5/3.6 MTP draft head; [n_vocab, n_outputs] when enabled
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

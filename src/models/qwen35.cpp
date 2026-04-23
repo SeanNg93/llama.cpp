@@ -74,6 +74,9 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     }
     cur = inpL;
 
+    // Snapshot the pre-output-norm residual for the MTP head (paper's h_i^{k-1}).
+    ggml_tensor * h_mtp = cur;
+
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
@@ -87,6 +90,37 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // M2: dispatch MTP head. Always built when weights are present; M3 will add a
+    // context-level toggle. h_mtp is post-gather (n_outputs); gather tok_ids and
+    // inp_pos to match. Note the reshape dance: ggml_get_rows on a 1D tensor
+    // returns a 2D tensor, so we view the 1D int array as [1, N] before gathering
+    // and reshape the result back to 1D.
+    if (hparams.nextn_predict_layers > 0 && res->t_inp_tokens) {
+        ggml_tensor * tok_ids_mtp = res->t_inp_tokens;
+        ggml_tensor * inp_pos_mtp = inp_pos;
+        if (inp_out_ids) {
+            ggml_tensor * toks_2d = ggml_reshape_2d(ctx0, res->t_inp_tokens, 1, res->t_inp_tokens->ne[0]);
+            ggml_tensor * pos_2d  = ggml_reshape_2d(ctx0, inp_pos,            1, inp_pos->ne[0]);
+            tok_ids_mtp = ggml_get_rows(ctx0, toks_2d, inp_out_ids);
+            inp_pos_mtp = ggml_get_rows(ctx0, pos_2d,  inp_out_ids);
+            tok_ids_mtp = ggml_reshape_1d(ctx0, tok_ids_mtp, tok_ids_mtp->ne[1]);
+            inp_pos_mtp = ggml_reshape_1d(ctx0, inp_pos_mtp, inp_pos_mtp->ne[1]);
+            cb(tok_ids_mtp, "mtp_tok_ids_out", -1);
+            cb(inp_pos_mtp, "mtp_inp_pos_out", -1);
+        }
+
+        ggml_tensor * mtp_logits = build_mtp_head(
+                h_mtp,
+                tok_ids_mtp,
+                inp->get_attn(),
+                inp_pos_mtp,
+                sections,
+                n_transformer_layers /* MTP block index = first block past the main stack */);
+
+        res->t_mtp_logits = mtp_logits;
+        ggml_build_forward_expand(gf, mtp_logits);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(
@@ -416,37 +450,17 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
     ggml_tensor * projected = build_lora_mm(layer.nextn.eh_proj, concat);
     cb(projected, "mtp_eh_proj", il);
 
-    // TRM_k(h'): one Qwen3.5 full-attention decoder block. Reuses the MTP block's
-    // own attn_q/k/v/o, q_norm, k_norm, ffn_gate/up/down, attn_norm, attn_post_norm,
-    // all loaded by the model loader onto layers[il].
-    //
-    // NOTE (M2 concern): build_layer_attn reads/writes KV cache at slot `il`.
-    // hparams.n_layer_kv_from_start excludes the MTP block, so layer il has no
-    // KV allocated. Dispatch must either extend KV coverage or use a stateless
-    // attention path. See M2 plan.
-    ggml_tensor * inpSA = projected;
+    // TODO(M3): full TRM_k transformer block here (attn with Q/K/V + mRoPE, then FFN).
+    // Skipped in M2 because mRoPE's 4×n_tokens position layout doesn't survive the
+    // inp_out_ids gather trivially and build_layer_attn pulls from KV at slot `il`
+    // which needs separate plumbing. The sub-graph below still exercises every
+    // MTP-specific weight (hnorm, enorm, eh_proj, shared_head_norm) plus the shared
+    // LM head, which is what M2 needs to verify via GGML_SCHED_DEBUG=2.
+    ggml_tensor * cur = projected;
+    (void) inp_attn;
+    (void) inp_pos;
+    (void) sections;
 
-    ggml_tensor * cur = build_norm(projected, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-    cb(cur, "mtp_attn_norm", il);
-
-    cur = build_layer_attn(inp_attn, cur, inp_pos, sections, il);
-    cb(cur, "mtp_attn_out", il);
-
-    cur = ggml_add(ctx0, cur, inpSA);
-    cb(cur, "mtp_attn_residual", il);
-
-    ggml_tensor * ffn_residual = cur;
-
-    ggml_tensor * attn_post = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
-    cb(attn_post, "mtp_attn_post_norm", il);
-
-    cur = build_layer_ffn(attn_post, il);
-    cb(cur, "mtp_ffn_out", il);
-
-    cur = ggml_add(ctx0, cur, ffn_residual);
-    cb(cur, "mtp_post_ffn", il);
-
-    // Shared final norm + shared lm_head (no dedicated shared_head_head in Qwen3.5/3.6)
     cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_shared_head_norm", il);
 
