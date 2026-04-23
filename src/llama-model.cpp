@@ -2814,10 +2814,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
                 ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-                // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
+                // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack.
+                // Unlike GLM4-MoE / Bailing where MTP is never executed, Qwen3.5 intends to
+                // dispatch MTP for drafting, so it needs its own KV slot. Leave
+                // n_layer_kv_from_start at the default (-1 → all layers have KV); the
+                // recurrent_layer_arr below keeps MTP on the full-attention path.
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
 
                 // Mark recurrent layers (linear attention layers). MTP layers are dense
                 // attention-only and must be flagged non-recurrent.
