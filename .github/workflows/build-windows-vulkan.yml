@@ -19,6 +19,19 @@ jobs:
         with:
           arch: x64
 
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Check Vulkan SDK
+        shell: pwsh
+        run: |
+          echo "VULKAN_SDK=$env:VULKAN_SDK"
+          where glslc
+          where vulkan-1.dll
+
       - name: Configure
         run: cmake -B build -DBUILD_SHARED_LIBS=OFF -DGGML_VULKAN=ON -DGGML_NATIVE=OFF
 
@@ -32,6 +45,7 @@ jobs:
           Copy-Item build/bin/Release/llama-server.exe artifact/
           Copy-Item build/bin/Release/llama-cli.exe artifact/
           Copy-Item build/bin/Release/*.dll artifact/ -ErrorAction SilentlyContinue
+          Copy-Item "$env:VULKAN_SDK\Bin\*.dll" artifact/ -ErrorAction SilentlyContinue
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
